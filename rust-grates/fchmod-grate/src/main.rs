@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use grate_rs::{
     GrateBuilder, GrateError,
-    constants::SYS_FCHMOD,
+    constants::{SYS_FCHMOD, SYS_FCHMODAT},
     make_threei_call,
 };
 
@@ -38,6 +38,48 @@ extern "C" fn fchmod_handler(
         arg3cage,
         arg4,
         arg4cage,
+        arg5,
+        arg5cage,
+        arg6,
+        arg6cage,
+        0,
+    ) {
+        Ok(r) => r,
+        Err(GrateError::MakeSyscallError(n)) => n,
+        Err(_) => -1,
+    }
+}
+
+extern "C" fn fchmodat_handler(
+    cageid: u64,
+    dirfd: u64,
+    dirfd_cage: u64,
+    path_ptr: u64,
+    path_cage: u64,
+    mode: u64,
+    mode_cage: u64,
+    flags: u64,
+    flags_cage: u64,
+    arg5: u64,
+    arg5cage: u64,
+    arg6: u64,
+    arg6cage: u64,
+) -> i32 {
+    let masked_mode = mode & MASK.load(Ordering::Relaxed);
+
+    match make_threei_call(
+        SYS_FCHMODAT as u32,
+        0,
+        cageid,
+        dirfd_cage,
+        dirfd,
+        dirfd_cage,
+        path_ptr,
+        path_cage,
+        masked_mode,
+        mode_cage,
+        flags,
+        flags_cage,
         arg5,
         arg5cage,
         arg6,
@@ -92,6 +134,7 @@ fn main() {
 
     GrateBuilder::new()
         .register(SYS_FCHMOD, fchmod_handler)
+        .register(SYS_FCHMODAT, fchmodat_handler)
         .teardown(|result| match result {
             Ok(status) => println!("[fchmod-grate] child exited with status: {status}"),
             Err(e) => {
