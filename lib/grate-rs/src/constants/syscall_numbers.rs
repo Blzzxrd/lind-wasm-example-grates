@@ -88,6 +88,7 @@ pub const SYS_CHMOD: u64 = 90;
 pub const SYS_FCHMOD: u64 = 91;
 pub const SYS_CHOWN: u64 = 92;
 pub const SYS_LCHOWN: u64 = 94;
+pub const SYS_UMASK: u64 = 95;
 
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;

@@ -254,3 +254,14 @@ type = "rust"
 
 [[grate.tests]]
 test_src = "test/fdtables_test.c"
+
+# ── Umask (Rust) ────────────────────────────────────────────────────
+
+[[grate]]
+name = "umask-grate"
+dir = "umask-grate"
+type = "rust"
+
+[[grate.tests]]
+test_src = "test/umask_test.c"
+grate_args = ["--force-bits", "022"]
