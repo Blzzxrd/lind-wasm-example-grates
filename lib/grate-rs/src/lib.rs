@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use crate::constants::lind::ELINDAPIABORTED;
 use crate::constants::mman::*;
 use crate::ffi::{
-    clean_exit, cp_data_impl, cp_handler_impl, execv, fork, getpid_impl, make_syscall_impl, mmap,
-    munmap, register_handler_impl, sem_destroy, sem_init, sem_post, sem_t, sem_wait, waitpid,
+    clean_exit, close, cp_data_impl, cp_handler_impl, execv, fork, getpid_impl, make_syscall_impl,
+    mmap, munmap, pipe, read, register_handler_impl, waitpid, write,
 };
 use crate::fd_support::FD_HANDLER_TABLE;
 
@@ -486,10 +486,11 @@ impl GrateBuilder {
 
         let path = c_argv[0];
 
-        // Set up a shared semaphore to ensure child cage waits until all handler registrations are
-        // complete before launching.
-        let sem: &mut sem_t = unsafe { mmap_shared::<sem_t>() };
-        call_sys!(teardown, sem_init(sem, 1, 0));
+        // The child blocks on the read end until the parent finishes handler registration and
+        // pre-exec setup. The pipe is inherited across fork and does not require a shared
+        // semaphore or its futex-backed wait path.
+        let mut launch_pipe = [-1 as c_int; 2];
+        call_sys!(teardown, pipe(launch_pipe.as_mut_ptr()));
 
         // Set up the shared LaunchState to coordinate errnos in case of a failed cage launch
         let state: &mut LaunchState = unsafe { mmap_shared::<LaunchState>() };
@@ -498,8 +499,30 @@ impl GrateBuilder {
             0 => {
                 // Child Cage
 
-                // Wait until parent indicates it's ready.
-                call_sys_child!(state, sem_wait(sem));
+                call_sys_child!(state, close(launch_pipe[1]));
+
+                // Wait for the parent to finish registration and pre-exec setup. EOF means the
+                // parent exited before releasing the child.
+                let mut launch_token = 0u8;
+                let read_result = unsafe {
+                    read(
+                        launch_pipe[0],
+                        &mut launch_token as *mut u8 as *mut c_void,
+                        1,
+                    )
+                };
+                let read_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                call_sys_child!(state, close(launch_pipe[0]));
+
+                if read_result != 1 {
+                    state.errno = if read_result < 0 {
+                        read_errno
+                    } else {
+                        libc::EPIPE
+                    };
+                    state.launch_failed = 1;
+                    clean_exit(1);
+                }
 
                 // Launch the child binary.
                 call_sys_child!(state, execv(path, c_argv.as_ptr()));
@@ -508,6 +531,8 @@ impl GrateBuilder {
             }
             cageid => {
                 // Parent cage - grate handler.
+
+                call_sys!(teardown, close(launch_pipe[0]));
 
                 // Set up fd translation policy based on builder configuration.
                 match &self.fd_translate_policy {
@@ -537,21 +562,33 @@ impl GrateBuilder {
                     callback(cageid);
                 }
 
-                // Indicate to the child that it can begin execution.
-                call_sys!(teardown, sem_post(sem));
+                // Release the child after all parent-side setup is complete.
+                let launch_token = 1u8;
+                let write_result = unsafe {
+                    write(
+                        launch_pipe[1],
+                        &launch_token as *const u8 as *const c_void,
+                        1,
+                    )
+                };
+                if write_result != 1 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    let _ = unsafe { close(launch_pipe[1]) };
+                    GrateBuilder::run_teardown(
+                        teardown,
+                        Err(GrateError::CoordinationError(format!(
+                            "write failed: {}",
+                            errno
+                        ))),
+                    );
+                }
+                call_sys!(teardown, close(launch_pipe[1]));
 
                 // Wait for the cage process to exit and retrieve its status code.
                 let mut status: i32 = 0;
                 let _ = call_sys!(
                     teardown,
                     waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0)
-                );
-
-                // Clean up semaphores.
-                call_sys!(teardown, sem_destroy(sem));
-                call_sys!(
-                    teardown,
-                    munmap(sem as *mut sem_t as *mut c_void, size_of::<sem_t>())
                 );
 
                 // Check whether the cage launched successfully.
