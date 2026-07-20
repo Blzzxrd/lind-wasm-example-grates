@@ -5,7 +5,7 @@
 //! - target-specific ABI type shims (for Lind compatibility)
 //! - raw `extern "C"` bindings used by the safe APIs in `lib.rs`
 use core::ffi::{c_char, c_int};
-use libc::{pid_t, size_t};
+use libc::{nfds_t, pid_t, pollfd, size_t};
 use std::ffi::{c_uint, c_void};
 use std::io::Write;
 
@@ -115,6 +115,8 @@ unsafe extern "C" {
     pub fn execv(prog: *const c_char, argv: *const *const c_char) -> c_int;
     pub fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
     pub fn pipe(pipefd: *mut c_int) -> c_int;
+    pub fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
+    pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     pub fn close(fd: c_int) -> c_int;

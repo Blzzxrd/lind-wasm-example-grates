@@ -19,7 +19,7 @@ use crate::constants::lind::ELINDAPIABORTED;
 use crate::constants::mman::*;
 use crate::ffi::{
     clean_exit, close, cp_data_impl, cp_handler_impl, execv, fork, getpid_impl, make_syscall_impl,
-    mmap, munmap, pipe, read, register_handler_impl, waitpid, write,
+    mmap, munmap, pipe2, poll, register_handler_impl, waitpid, write,
 };
 use crate::fd_support::FD_HANDLER_TABLE;
 
@@ -486,11 +486,14 @@ impl GrateBuilder {
 
         let path = c_argv[0];
 
-        // The child blocks on the read end until the parent finishes handler registration and
-        // pre-exec setup. The pipe is inherited across fork and does not require a shared
-        // semaphore or its futex-backed wait path.
+        // The child polls the read end until the parent finishes handler registration and
+        // pre-exec setup. Both descriptors are closed automatically by a successful exec, so the
+        // child never calls read or close after its filesystem handlers have been installed.
         let mut launch_pipe = [-1 as c_int; 2];
-        call_sys!(teardown, pipe(launch_pipe.as_mut_ptr()));
+        call_sys!(
+            teardown,
+            pipe2(launch_pipe.as_mut_ptr(), libc::O_CLOEXEC)
+        );
 
         // Set up the shared LaunchState to coordinate errnos in case of a failed cage launch
         let state: &mut LaunchState = unsafe { mmap_shared::<LaunchState>() };
@@ -499,27 +502,16 @@ impl GrateBuilder {
             0 => {
                 // Child Cage
 
-                call_sys_child!(state, close(launch_pipe[1]));
-
-                // Wait for the parent to finish registration and pre-exec setup. EOF means the
-                // parent exited before releasing the child.
-                let mut launch_token = 0u8;
-                let read_result = unsafe {
-                    read(
-                        launch_pipe[0],
-                        &mut launch_token as *mut u8 as *mut c_void,
-                        1,
-                    )
+                // IMFS does not interpose poll. Waiting for readability avoids child-side
+                // read/close calls being redirected after handler registration.
+                let mut launch_event = libc::pollfd {
+                    fd: launch_pipe[0],
+                    events: libc::POLLIN,
+                    revents: 0,
                 };
-                let read_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-                call_sys_child!(state, close(launch_pipe[0]));
-
-                if read_result != 1 {
-                    state.errno = if read_result < 0 {
-                        read_errno
-                    } else {
-                        libc::EPIPE
-                    };
+                call_sys_child!(state, poll(&mut launch_event, 1, -1));
+                if launch_event.revents & libc::POLLIN == 0 {
+                    state.errno = libc::EPIPE;
                     state.launch_failed = 1;
                     clean_exit(1);
                 }
