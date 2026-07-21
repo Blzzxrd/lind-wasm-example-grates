@@ -1,130 +1,74 @@
+# CI for lind-wasm-example-grates
+#
+# Runs identically for pull requests targeting main and for pushes to main.
+# The goal of this stage is a single thing: surface a pass/fail test signal
+# on the PR. Image publishing is deliberately out of scope.
 options:
   logging: CLOUD_LOGGING_ONLY
-  machineType: E2_HIGHCPU_32
+  machineType: E2_HIGHCPU_8
+  substitution_option: ALLOW_LOOSE
 
 steps:
   - name: "gcr.io/cloud-builders/docker"
-    id: Docker Login
-    entrypoint: bash
-    args:
-      - -c
-      - |
-        set -euo pipefail
-        docker login --username="$$DOCKER_USERNAME" --password="$$DOCKER_PASSWORD"
-    secretEnv:
-      - DOCKER_USERNAME
-      - DOCKER_PASSWORD
-
-  - name: "gcr.io/cloud-builders/docker"
-    id: Test Grates And Push Dev Image
+    id: Build And Test
     entrypoint: bash
     env:
-      - "BRANCH_NAME=$BRANCH_NAME"
-      - "COMMIT_SHA=$COMMIT_SHA"
-      - "SHORT_SHA=$SHORT_SHA"
+      # PR triggers set _HEAD_BRANCH; push triggers set BRANCH_NAME.
+      - "HEAD_BRANCH=${_HEAD_BRANCH}"
+      - "BRANCH_NAME=${BRANCH_NAME}"
+      - "COMMIT_SHA=${COMMIT_SHA}"
     args:
       - -c
       - |
         set -euo pipefail
 
-        branch_name="${BRANCH_NAME:-main}"
-        commit_sha="${COMMIT_SHA:-}"
-        short_sha="${SHORT_SHA:-manual}"
-        image_repo="docker.io/securesystemslab/lind-wasm-grates-examples"
-        cache_ref="${image_repo}:buildcache"
+        branch="${HEAD_BRANCH:-${BRANCH_NAME:-unknown}}"
+        commit="${COMMIT_SHA:-}"
 
-        mkdir -p /workspace/artifacts /workspace/test-results
-        build_log=/workspace/artifacts/buildx.log
-        exec > >(tee -a "${build_log}") 2>&1
+        # Write outputs outside /workspace.
+        out=/tmp/grates-out
+        rm -rf "${out}"
 
-        print_failure_context() {
-          if [[ -f /workspace/test-results/e2e_status ]]; then
-            echo "== e2e_status =="
-            cat /workspace/test-results/e2e_status
-          else
-            echo "== e2e_status missing =="
-          fi
-
-          if [[ -f /workspace/test-results/test-artifacts/revision.txt ]]; then
-            echo "== revision.txt =="
-            cat /workspace/test-results/test-artifacts/revision.txt
-          else
-            echo "== revision.txt missing =="
-          fi
-
-          if [[ -f /workspace/test-results/test-artifacts/make-test.log ]]; then
-            echo "== make-test.log tail =="
-            tail -n 200 /workspace/test-results/test-artifacts/make-test.log
-          else
-            echo "== make-test.log missing =="
-          fi
-        }
-
-        docker buildx create --use --name cbuilder || docker buildx use cbuilder
+        # --output type=local requires the docker-container driver.
+        docker buildx create --use --name cbuilder --driver docker-container \
+          || docker buildx use cbuilder
         docker buildx inspect --bootstrap
 
-        echo "Running tests for branch=${branch_name} commit=${commit_sha:-<none>}"
-        rm -rf /workspace/test-results
-        mkdir -p /workspace/test-results
+        echo "Testing branch=${branch} commit=${commit:-<none>}"
 
+        # The Dockerfile's test stage catches make failures and records the outcome in e2e_status.
         if ! docker buildx build \
           --platform=linux/amd64 \
           --progress=plain \
           --pull \
           --target artifacts \
-          --build-arg BRANCH_NAME="${branch_name}" \
-          --build-arg COMMIT_SHA="${commit_sha}" \
-          --cache-from=type=registry,ref="${cache_ref}" \
-          --cache-to=type=registry,ref="${cache_ref}",mode=max \
-          --output type=local,dest=/workspace/test-results \
+          --build-arg BRANCH_NAME="${branch}" \
+          --build-arg COMMIT_SHA="${commit}" \
+          --output type=local,dest="${out}" \
           .; then
-          echo "Artifact build failed before the test grate."
-          print_failure_context
+          echo "Build failed before the test stage could run."
           exit 1
         fi
 
-        if [[ ! -f /workspace/test-results/e2e_status ]]; then
-          echo "Missing /workspace/test-results/e2e_status after test build."
-          print_failure_context
+        if [[ ! -f "${out}/e2e_status" ]]; then
+          echo "e2e_status was not produced. Check the artifacts stage."
           exit 1
         fi
 
-        status_value="$(tr -d '\r\n' < /workspace/test-results/e2e_status)"
-        tests_failed=0
-        echo "Test status: ${status_value}"
-        if [[ "${status_value}" != "E2E_STATUS=pass" ]]; then
-          tests_failed=1
-          echo "Tests failed; the dev image will still be pushed so users can inspect logs in-container."
-        fi
+        echo "===== test summary ====="
+        cat "${out}/test-artifacts/test-summary.txt" || true
+        echo "========================"
 
-        tag_args=(
-          -t "${image_repo}:sha-${short_sha}"
-          -t "${image_repo}:latest"
-        )
+        status="$(tr -d '\r\n' < "${out}/e2e_status")"
+        echo "e2e_status: ${status}"
 
-        echo "Pushing dev image ${image_repo}:sha-${short_sha} and ${image_repo}:latest"
-        docker buildx build \
-          --platform=linux/amd64 \
-          --progress=plain \
-          --pull \
-          --target dev \
-          --build-arg BRANCH_NAME="${branch_name}" \
-          --build-arg COMMIT_SHA="${commit_sha}" \
-          --cache-from=type=registry,ref="${cache_ref}" \
-          --cache-to=type=registry,ref="${cache_ref}",mode=max \
-          "${tag_args[@]}" \
-          --push \
-          .
-
-        if [[ ${tests_failed} -ne 0 ]]; then
-          echo "Dev image pushed, but tests failed."
-          print_failure_context
+        if [[ "${status}" != "E2E_STATUS=pass" ]]; then
+          echo "===== make-test.log (last 200 lines) ====="
+          tail -n 200 "${out}/test-artifacts/make-test.plain.log" || true
+          echo "=========================================="
+          echo "One or more grate tests failed. See the summary above for the"
+          echo "full pass/fail breakdown, and the log tail for details."
           exit 1
         fi
 
-availableSecrets:
-  secretManager:
-    - versionName: projects/x-micron-451502-m7/secrets/docker-username/versions/latest
-      env: DOCKER_USERNAME
-    - versionName: projects/x-micron-451502-m7/secrets/docker-password/versions/latest
-      env: DOCKER_PASSWORD
+        echo "All tests passed."
