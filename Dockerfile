@@ -4,7 +4,7 @@
 #   base      : Pre-built lind-wasm-dev toolchain
 #   source    : Copies build context and records revision metadata
 #   test      : Runs `make test` and parses results
-#   dev       : Interactive debugging environment for reproducing failures (pushed to Docker Hub)
+#   dev       : Interactive debugging environment for reproducing failures (pushed to Docker Hub / Not yet)
 #   artifacts : Minimal stage for extracting test outputs via `--output type=local`
 #
 # Usage Examples:
