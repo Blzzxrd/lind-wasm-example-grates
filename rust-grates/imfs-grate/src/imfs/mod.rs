@@ -67,6 +67,8 @@ const IMFS_BLOCK_SIZE: i32 = 512;
 // IMFS_BLOCK_SIZE, the POSIX-fixed 512-byte unit for st_blocks.
 const IMFS_PREFERRED_IO_SIZE: i32 = 4096;
 const LIND_AT_FDCWD: i32 = -100;
+const LIND_AT_REMOVEDIR: i32 = 0x200;
+const LIND_AT_SYMLINK_FOLLOW: i32 = 0x400;
 const LIND_AT_NO_AUTOMOUNT: i32 = 0x800;
 const LIND_AT_EMPTY_PATH: i32 = 0x1000;
 const IMFS_STATFS_MAGIC: u64 = 0x494d_4653; // "IMFS"
@@ -1201,7 +1203,7 @@ impl ImfsState {
             Ok(path) => path,
             Err(e) => return e,
         };
-        self.stat_resolved_path(&norm_path, statbuf, flags & libc::AT_SYMLINK_NOFOLLOW == 0)
+        self.stat_resolved_path(&norm_path, statbuf, flags & AT_SYMLINK_NOFOLLOW == 0)
     }
 
     fn stat_resolved_path(
@@ -1574,7 +1576,7 @@ impl ImfsState {
     }
 
     pub fn unlinkat(&mut self, cage_id: u64, dirfd: i32, path: &str, flags: i32) -> i32 {
-        let supported_flags = libc::AT_REMOVEDIR;
+        let supported_flags = LIND_AT_REMOVEDIR;
         if flags & !supported_flags != 0 {
             return -22; // EINVAL
         }
@@ -1584,7 +1586,7 @@ impl ImfsState {
             Err(e) => return e,
         };
 
-        if flags & libc::AT_REMOVEDIR != 0 {
+        if flags & LIND_AT_REMOVEDIR != 0 {
             self.rmdir_resolved_path(&norm_path)
         } else {
             self.unlink_resolved_path(&norm_path)
@@ -1638,7 +1640,7 @@ impl ImfsState {
         newpath: &str,
         flags: i32,
     ) -> i32 {
-        let supported_flags = libc::AT_SYMLINK_FOLLOW;
+        let supported_flags = LIND_AT_SYMLINK_FOLLOW;
         if flags & !supported_flags != 0 {
             return -22; // EINVAL
         }
@@ -1654,7 +1656,7 @@ impl ImfsState {
         self.link_resolved_paths(
             &norm_oldpath,
             &norm_newpath,
-            flags & libc::AT_SYMLINK_FOLLOW != 0,
+            flags & LIND_AT_SYMLINK_FOLLOW != 0,
         )
     }
 
