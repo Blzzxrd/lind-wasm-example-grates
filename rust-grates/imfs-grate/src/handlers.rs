@@ -14,6 +14,7 @@ use crate::imfs;
 const MAX_PATH_LEN: usize = 256;
 const IOV_MAX: usize = 1024;
 const LIND_AT_EMPTY_PATH: i32 = 0x1000;
+const LIND_AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 
 /// Copy a null-terminated path string from a cage's address space into a local buffer.
 fn copy_path_from_cage(path_ptr: u64, path_cage: u64) -> Option<String> {
@@ -591,7 +592,7 @@ pub extern "C" fn fchmodat_handler(
     _arg6: u64,
     _arg6cage: u64,
 ) -> i32 {
-    let supported_flags = libc::AT_SYMLINK_NOFOLLOW | LIND_AT_EMPTY_PATH;
+    let supported_flags = LIND_AT_SYMLINK_NOFOLLOW | LIND_AT_EMPTY_PATH;
     if (arg4 as i32) & !supported_flags != 0 {
         return -22;
     }
@@ -665,7 +666,7 @@ pub extern "C" fn fchownat_handler(
     _arg6: u64,
     _arg6cage: u64,
 ) -> i32 {
-    let supported_flags = libc::AT_SYMLINK_NOFOLLOW | LIND_AT_EMPTY_PATH;
+    let supported_flags = LIND_AT_SYMLINK_NOFOLLOW | LIND_AT_EMPTY_PATH;
     if (arg5 as i32) & !supported_flags != 0 {
         return -22;
     }
