@@ -32,6 +32,7 @@ RUN mkdir -p /home/lind/e2e-artifacts && \
 
 # ── test ────────────────────────────────────────────────────────────────────
 FROM source AS test
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV LIND_WASM_ROOT=/home/lind/lind-wasm
 WORKDIR /home/lind/lind-wasm-example-grates
 

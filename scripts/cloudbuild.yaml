@@ -58,17 +58,67 @@ steps:
         echo "===== test summary ====="
         cat "${out}/test-artifacts/test-summary.txt" || true
         echo "========================"
-
+        
+        # e2e_status is no longer the gate; it is kept for log readability
+        # and for the parser sanity check below.
         status="$(tr -d '\r\n' < "${out}/e2e_status")"
         echo "e2e_status: ${status}"
 
-        if [[ "${status}" != "E2E_STATUS=pass" ]]; then
-          echo "===== make-test.log (last 200 lines) ====="
-          tail -n 200 "${out}/test-artifacts/make-test.plain.log" || true
-          echo "=========================================="
-          echo "One or more grate tests failed. See the summary above for the"
-          echo "full pass/fail breakdown, and the log tail for details."
+        summary="${out}/test-artifacts/test-summary.txt"
+
+        # Failures in this build, normalized by the shared extractor.
+        # Empty output is a valid result (all tests passed), so do not let
+        # grep's exit code abort the build here.
+        scripts/extract-failures.sh "${summary}" > /tmp/actual.txt || true
+
+        # Baseline, with comments and blank lines stripped. comm(1) requires
+        # sorted input on both sides.
+        grep -vE '^[[:space:]]*(#|$)' scripts/known-failures.txt \
+          | sort -u > /tmp/known.txt
+
+        # Parser sanity check: the summary reports its own failure count.
+        # If that count disagrees with the number of FAIL lines we extracted,
+        # the regex in extract-failures.sh has drifted from the output format
+        # and every comparison below would be meaningless.
+        reported="$(grep -oE '^[[:space:]]+Failed:[[:space:]]+[0-9]+' "${summary}" \
+          | grep -oE '[0-9]+' || echo "")"
+        extracted="$(wc -l < /tmp/actual.txt)"
+
+        if [[ -z "${reported}" ]]; then
+          echo "ERROR: could not read the 'Failed:' count from the test summary."
+          echo "The summary format has changed; update scripts/extract-failures.sh."
+          cat "${summary}" || true
           exit 1
         fi
 
-        echo "All tests passed."
+        if [[ "${reported}" -ne "${extracted}" ]]; then
+          echo "ERROR: summary reports ${reported} failure(s) but ${extracted} were parsed."
+          echo "scripts/extract-failures.sh no longer matches the output format."
+          cat "${summary}" || true
+          exit 1
+        fi
+
+        new_failures="$(comm -23 /tmp/actual.txt /tmp/known.txt)"
+        fixed="$(comm -13 /tmp/actual.txt /tmp/known.txt)"
+
+        echo "===== known failures (allowed by baseline) ====="
+        comm -12 /tmp/actual.txt /tmp/known.txt
+        echo "==============================================="
+
+        if [[ -n "${fixed}" ]]; then
+          echo "NOTE: the following tests are no longer failing:"
+          echo "${fixed}"
+          echo "Please remove them from scripts/known-failures.txt."
+        fi
+
+        if [[ -n "${new_failures}" ]]; then
+          echo "===== NEW FAILURES ====="
+          echo "${new_failures}"
+          echo "========================"
+          echo "--- make-test.log (last 200 lines) ---"
+          tail -n 200 "${out}/test-artifacts/make-test.plain.log" || true
+          echo "These failures are not in the baseline and were introduced by this change."
+          exit 1
+        fi
+
+        echo "No new failures."

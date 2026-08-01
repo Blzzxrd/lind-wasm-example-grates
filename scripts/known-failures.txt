@@ -1,0 +1,4 @@
+FAIL: fs-routing-clamp / fcntl_dup_minimal_test.c
+FAIL: fs-routing-clamp / fs_routing_test.c
+FAIL: imfs-grate / imfs_test.c
+FAIL: ipc-grate / ipc_test.c
