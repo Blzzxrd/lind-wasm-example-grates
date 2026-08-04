@@ -57,6 +57,17 @@ cd rust-grates/devnull-grate
 cargo lind_compile --output-dir grates
 ```
 
+## Testing
+
+From the repository root, run only the `devnull-grate` tests:
+
+```bash
+make test GRATE=devnull-grate
+```
+
+The test verifies `/dev/null` reads and writes, multiple virtual descriptors,
+large writes, closing descriptors, and pass-through access to a regular file.
+
 ## Code layout
 
 - `src/main.rs`: handler registration through `GrateBuilder`, initial
