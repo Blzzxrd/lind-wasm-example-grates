@@ -49,7 +49,11 @@ lind-wasm grates/fd-translate-grate.cwasm <program> [args...]
 From the repository root:
 
 ```bash
+# Build the grate
 make rust/fd-translate-grate
+
+# Build the program to run through the grate
+lind_compile -s path/to/program.c
 ```
 
 ## Known limitations
