@@ -1,0 +1,112 @@
+# Weekly full-suite CI for lind-wasm-example-grates
+#
+# Invoked by a Manual trigger that Cloud Scheduler fires every Friday at 07:00
+# America/New_York. Runs the complete test suite and reports the outcome.
+#
+# Stage 0 scope: prove the schedule fires and the full suite completes.
+# Results live in the build log only. Publishing them to GitHub Releases and
+# Docker Hub comes in later stages, as steps inserted before Evaluate.
+#
+# Step layout:
+#   1. Build And Test - runs the Dockerfile's test stage, writes to /workspace
+#   2. Evaluate       - reads e2e_status and decides the build's pass/fail
+#
+# The pass/fail decision is deliberately the LAST step. The Dockerfile records
+# test failures in e2e_status rather than failing the build, so step 1 succeeds
+# even when tests fail. Later stages depend on this: a failing week must still
+# reach the publishing steps, since those are the weeks worth recording.
+#
+# Shell variables are written as $$VAR. Cloud Build resolves $VAR itself before
+# handing the script to bash, so the extra $ is what keeps bash's expansion
+# intact. Cloud Build values reach the script through env: instead.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  substitution_option: ALLOW_LOOSE
+
+# The full suite is slower than a per-directory PR run, and ipc-grate is a
+# known timeout offender. 60 minutes leaves room without hanging all morning.
+timeout: 3600s
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    id: Build And Test
+    entrypoint: bash
+    env:
+      # Manual triggers populate BRANCH_NAME from the branch the trigger runs
+      # against. COMMIT_SHA may be empty; the Dockerfile handles that.
+      - "BRANCH_NAME=$BRANCH_NAME"
+      - "COMMIT_SHA=$COMMIT_SHA"
+    args:
+      - -c
+      - |
+        set -euo pipefail
+
+        branch="$${BRANCH_NAME:-main}"
+        commit="$${COMMIT_SHA:-}"
+
+        # Output goes under /workspace because that volume is shared across
+        # steps. Evaluate reads it, and later stages will publish from it.
+        out=/workspace/out
+        rm -rf "$${out}"
+
+        # --output type=local needs the docker-container driver; the default
+        # docker driver cannot export a filesystem.
+        docker buildx create --use --name cbuilder --driver docker-container \
+          || docker buildx use cbuilder
+        docker buildx inspect --bootstrap
+
+        echo "Weekly run: branch=$${branch} commit=$${commit:-<none>}"
+
+        # No TEST_DIRS build-arg, so the Dockerfile runs the full suite.
+        # This command fails only if the image build itself fails. A test
+        # failure is captured in e2e_status and evaluated in the next step.
+        docker buildx build \
+          --platform=linux/amd64 \
+          --progress=plain \
+          --pull \
+          --target artifacts \
+          --build-arg BRANCH_NAME="$${branch}" \
+          --build-arg COMMIT_SHA="$${commit}" \
+          --output type=local,dest="$${out}" \
+          .
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: Evaluate
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -uo pipefail
+
+        out=/workspace/out
+
+        # Reaching here without e2e_status means the image built but the test
+        # stage did not produce its marker - a Dockerfile problem, not a test
+        # failure. Worth distinguishing in the logs.
+        if [[ ! -f "$${out}/e2e_status" ]]; then
+          echo "e2e_status was not produced. Check the test and artifacts stages."
+          exit 1
+        fi
+
+        echo "===== revision ====="
+        cat "$${out}/test-artifacts/revision.txt" || true
+
+        echo "===== test summary ====="
+        cat "$${out}/test-artifacts/test-summary.txt" || true
+        echo "========================"
+
+        status="$(tr -d '\r\n' < "$${out}/e2e_status")"
+        echo "e2e_status: $${status}"
+
+        if [[ "$${status}" != "E2E_STATUS=pass" ]]; then
+          echo "===== make-test.log (last 200 lines) ====="
+          tail -n 200 "$${out}/test-artifacts/make-test.plain.log" || true
+          echo "=========================================="
+          echo "One or more grate tests failed. See the summary above for the"
+          echo "full pass/fail breakdown, and the log tail for details."
+          exit 1
+        fi
+
+        echo "All tests passed."
