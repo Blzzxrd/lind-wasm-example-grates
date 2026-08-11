@@ -1,32 +1,20 @@
 # Weekly full-suite CI for lind-wasm-example-grates
 #
-# Invoked by a Manual trigger that Cloud Scheduler fires every Friday at 07:00
-# America/New_York. Runs the complete test suite and reports the outcome.
-#
+# This is a Cloud Build configuration that runs the full test suite every week.
+# 
 # Stage 0 scope: prove the schedule fires and the full suite completes.
-# Results live in the build log only. Publishing them to GitHub Releases and
-# Docker Hub comes in later stages, as steps inserted before Evaluate.
+# Results live in the build log only. Publishing them to GitHub Releases and Docker Hub comes in later stages, as steps inserted before Evaluate.
 #
 # Step layout:
 #   1. Build And Test - runs the Dockerfile's test stage, writes to /workspace
 #   2. Evaluate       - reads e2e_status and decides the build's pass/fail
 #
-# The pass/fail decision is deliberately the LAST step. The Dockerfile records
-# test failures in e2e_status rather than failing the build, so step 1 succeeds
-# even when tests fail. Later stages depend on this: a failing week must still
-# reach the publishing steps, since those are the weeks worth recording.
-#
-# Shell variables are written as $$VAR. Cloud Build resolves $VAR itself before
-# handing the script to bash, so the extra $ is what keeps bash's expansion
-# intact. Cloud Build values reach the script through env: instead.
-
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: E2_HIGHCPU_8
   substitution_option: ALLOW_LOOSE
 
-# The full suite is slower than a per-directory PR run, and ipc-grate is a
-# known timeout offender. 60 minutes leaves room without hanging all morning.
+# The full suite is slower than a per-directory PR run, and ipc-grate is a known timeout offender. 60 minutes leaves room without hanging all morning.
 timeout: 3600s
 
 steps:
