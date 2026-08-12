@@ -1,20 +1,43 @@
 # Weekly full-suite CI for lind-wasm-example-grates
 #
-# This is a Cloud Build configuration that runs the full test suite every week.
-# 
-# Stage 0 scope: prove the schedule fires and the full suite completes.
-# Results live in the build log only. Publishing them to GitHub Releases and Docker Hub comes in later stages, as steps inserted before Evaluate.
+# Invoked by a Manual trigger that Cloud Scheduler fires every Friday at 07:00
+# America/New_York. Runs the complete test suite, publishes the result as a
+# GitHub pre-release, and reports pass/fail.
 #
 # Step layout:
-#   1. Build And Test - runs the Dockerfile's test stage, writes to /workspace
-#   2. Evaluate       - reads e2e_status and decides the build's pass/fail
+#   1. Build And Test   - runs the Dockerfile's test stage, writes to /workspace
+#   2. Publish Release  - creates or updates a date-tagged GitHub pre-release
+#   3. Evaluate         - reads e2e_status and decides the build's pass/fail
 #
+# The pass/fail decision is deliberately the LAST step. The Dockerfile records
+# test failures in e2e_status rather than failing the build, so step 1 succeeds
+# even when tests fail. That ordering is what lets a failing week still reach
+# the release step - those are the weeks most worth recording.
+#
+# Step 2 never fails the build. A publishing problem (expired token, GitHub
+# outage) must not be reported as a test failure, so it exits 0 and explains
+# itself in the log.
+#
+# Shell variables are written as $$VAR. Cloud Build resolves $VAR itself before
+# handing the script to bash, so the extra $ is what keeps bash's expansion
+# intact. Cloud Build values reach the script through env: instead.
+
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: E2_HIGHCPU_8
   substitution_option: ALLOW_LOOSE
 
-# The full suite is slower than a per-directory PR run, and ipc-grate is a known timeout offender. 60 minutes leaves room without hanging all morning.
+substitutions:
+  _GITHUB_REPO: "Lind-Project/lind-wasm-example-grates"
+  _BASE_IMAGE: "securesystemslab/lind-wasm-dev:latest"
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/x-micron-451502-m7/secrets/github-token-grates-ci/versions/latest
+      env: GITHUB_TOKEN
+
+# The full suite is slower than a per-directory PR run, and ipc-grate is a
+# known timeout offender. 60 minutes leaves room without hanging all morning.
 timeout: 3600s
 
 steps:
@@ -23,9 +46,11 @@ steps:
     entrypoint: bash
     env:
       # Manual triggers populate BRANCH_NAME from the branch the trigger runs
-      # against. COMMIT_SHA may be empty; the Dockerfile handles that.
+      # against. COMMIT_SHA is empty on manual triggers; the release step
+      # resolves it from the GitHub API instead.
       - "BRANCH_NAME=$BRANCH_NAME"
       - "COMMIT_SHA=$COMMIT_SHA"
+      - "BASE_IMAGE=${_BASE_IMAGE}"
     args:
       - -c
       - |
@@ -35,7 +60,7 @@ steps:
         commit="$${COMMIT_SHA:-}"
 
         # Output goes under /workspace because that volume is shared across
-        # steps. Evaluate reads it, and later stages will publish from it.
+        # steps. Publish Release and Evaluate both read from it.
         out=/workspace/out
         rm -rf "$${out}"
 
@@ -45,11 +70,18 @@ steps:
           || docker buildx use cbuilder
         docker buildx inspect --bootstrap
 
+        # Resolve the base image digest so the release records exactly which
+        # toolchain produced these results. Non-fatal: a missing digest is
+        # worth less provenance, not a failed build.
+        base_digest="$(docker buildx imagetools inspect "$${BASE_IMAGE}" \
+          --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+        echo "Base image: $${BASE_IMAGE}@$${base_digest:-<unresolved>}"
+
         echo "Weekly run: branch=$${branch} commit=$${commit:-<none>}"
 
         # No TEST_DIRS build-arg, so the Dockerfile runs the full suite.
         # This command fails only if the image build itself fails. A test
-        # failure is captured in e2e_status and evaluated in the next step.
+        # failure is captured in e2e_status and evaluated in the last step.
         docker buildx build \
           --platform=linux/amd64 \
           --progress=plain \
@@ -57,8 +89,131 @@ steps:
           --target artifacts \
           --build-arg BRANCH_NAME="$${branch}" \
           --build-arg COMMIT_SHA="$${commit}" \
+          --build-arg BASE_DIGEST="$${base_digest}" \
           --output type=local,dest="$${out}" \
           .
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: Publish Release
+    entrypoint: bash
+    secretEnv: ["GITHUB_TOKEN"]
+    env:
+      - "BRANCH_NAME=$BRANCH_NAME"
+      - "COMMIT_SHA=$COMMIT_SHA"
+      - "BUILD_ID=$BUILD_ID"
+      - "PROJECT_ID=$PROJECT_ID"
+      - "GITHUB_REPO=${_GITHUB_REPO}"
+      - "BASE_IMAGE=${_BASE_IMAGE}"
+    args:
+      - -c
+      - |
+        # No -e: this step reports problems and exits 0. Publishing is a
+        # recording concern, not a test result.
+        set -uo pipefail
+
+        out=/workspace/out
+        api=https://api.github.com
+
+        # Every early exit goes through here so the reason lands in the log.
+        skip() { echo "Publish skipped: $$1"; exit 0; }
+
+        [[ -n "$${GITHUB_TOKEN:-}" ]] || skip "GITHUB_TOKEN is empty."
+        [[ -f "$${out}/test-artifacts/test-summary.txt" ]] \
+          || skip "no test summary was produced."
+
+        # Refuse to guess. Tagging the wrong branch is worse than not tagging.
+        branch="$${BRANCH_NAME:-}"
+        [[ -n "$${branch}" ]] \
+          || skip "BRANCH_NAME is empty, so the branch to tag is unknown."
+
+        auth=(-H "Authorization: Bearer $${GITHUB_TOKEN}"
+              -H "Accept: application/vnd.github+json"
+              -H "X-GitHub-Api-Version: 2022-11-28")
+
+        # Manual triggers leave COMMIT_SHA empty, so resolve the branch head.
+        commit="$${COMMIT_SHA:-}"
+        if [[ -z "$${commit}" ]]; then
+          commit="$(curl -sS "$${auth[@]}" \
+            "$${api}/repos/$${GITHUB_REPO}/commits/$${branch}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("sha",""))' \
+            2>/dev/null)"
+        fi
+        [[ -n "$${commit}" ]] \
+          || skip "could not resolve the head commit of $${branch}."
+
+        tag="$(date -u +%Y-%m-%d)"
+        base_digest="$(grep '^base_digest=' "$${out}/test-artifacts/revision.txt" \
+          | cut -d= -f2- || true)"
+
+        # Body: the summary verbatim, then the provenance needed to reproduce
+        # this exact run.
+        {
+          echo '```'
+          cat "$${out}/test-artifacts/test-summary.txt"
+          echo '```'
+          echo
+          echo "branch: \`$${branch}\`"
+          echo "commit: \`$${commit}\`"
+          echo "base image: \`$${BASE_IMAGE}@$${base_digest:-unresolved}\`"
+          echo "build log: https://console.cloud.google.com/cloud-build/builds/$${BUILD_ID}?project=$${PROJECT_ID}"
+        } > /workspace/release-body.md
+
+        # Build the JSON payload in python so the summary text is escaped
+        # correctly regardless of what the test output contained.
+        python3 - "$${tag}" "$${commit}" /workspace/release-body.md \
+          > /workspace/release-payload.json <<'PY'
+        import json, sys
+        tag, commit, body_path = sys.argv[1], sys.argv[2], sys.argv[3]
+        with open(body_path) as f:
+            body = f.read()
+        print(json.dumps({
+            "tag_name": tag,
+            "target_commitish": commit,
+            "name": "Weekly grate test " + tag,
+            "body": body,
+            "prerelease": True,
+            "make_latest": "false",
+        }))
+        PY
+
+        # A same-day rerun updates the existing release rather than failing on
+        # a duplicate tag. Numbered suffixes can come later if a week ever
+        # needs more than one recorded run.
+        release_id="$(curl -sS "$${auth[@]}" \
+          "$${api}/repos/$${GITHUB_REPO}/releases/tags/$${tag}" \
+          | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' \
+          2>/dev/null)"
+
+        if [[ -n "$${release_id}" ]]; then
+          echo "Release for $${tag} exists (id=$${release_id}). Updating it."
+
+          # The tag itself still points at the earlier commit, so move it.
+          curl -sS -o /dev/null -w 'move tag: HTTP %{http_code}\n' \
+            -X PATCH "$${auth[@]}" \
+            "$${api}/repos/$${GITHUB_REPO}/git/refs/tags/$${tag}" \
+            -d "{\"sha\":\"$${commit}\",\"force\":true}"
+
+          code="$(curl -sS -o /workspace/release-response.json -w '%{http_code}' \
+            -X PATCH "$${auth[@]}" \
+            "$${api}/repos/$${GITHUB_REPO}/releases/$${release_id}" \
+            -d @/workspace/release-payload.json)"
+        else
+          echo "Creating release $${tag}."
+          code="$(curl -sS -o /workspace/release-response.json -w '%{http_code}' \
+            -X POST "$${auth[@]}" \
+            "$${api}/repos/$${GITHUB_REPO}/releases" \
+            -d @/workspace/release-payload.json)"
+        fi
+
+        if [[ "$${code}" == 2* ]]; then
+          url="$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("html_url",""))' \
+            < /workspace/release-response.json 2>/dev/null)"
+          echo "Published: $${url}"
+        else
+          echo "GitHub returned HTTP $${code}. The test result below still stands."
+          head -c 2000 /workspace/release-response.json || true
+          echo
+        fi
 
   - name: "gcr.io/cloud-builders/gcloud"
     id: Evaluate
@@ -98,3 +253,4 @@ steps:
         fi
 
         echo "All tests passed."
+        

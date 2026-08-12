@@ -12,6 +12,9 @@
 #   docker buildx build --target dev -t <repo>:<tag> --push .
 ARG BRANCH_NAME=main
 ARG COMMIT_SHA=
+# Digest of the lind-wasm-dev base image, resolved by the caller. The :latest
+# tag moves, so recording the digest is what makes a run reproducible later.
+ARG BASE_DIGEST=
 ARG HOME_DIR=/home/lind
 
 # ── base ────────────────────────────────────────────────────────────────────
@@ -24,13 +27,15 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 FROM base AS source
 ARG BRANCH_NAME
 ARG COMMIT_SHA
+ARG BASE_DIGEST
 
 COPY --chown=lind:lind . ${HOME_DIR}/lind-wasm-example-grates
 WORKDIR ${HOME_DIR}/lind-wasm-example-grates
 
 RUN mkdir -p ${HOME_DIR}/e2e-artifacts && \
-    printf 'branch=%s\ncommit=%s\nbuilt_at=%s\n' \
-        "${BRANCH_NAME}" "${COMMIT_SHA:-<none>}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    printf 'branch=%s\ncommit=%s\nbase_digest=%s\nbuilt_at=%s\n' \
+        "${BRANCH_NAME}" "${COMMIT_SHA:-<none>}" "${BASE_DIGEST:-<none>}" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > ${HOME_DIR}/e2e-artifacts/revision.txt
 
 # ── test ────────────────────────────────────────────────────────────────────
