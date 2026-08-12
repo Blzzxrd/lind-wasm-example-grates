@@ -50,10 +50,9 @@ From the repository root:
 
 ```bash
 # Build the grate
-make rust/fd-translate-grate
-
-# Build the program to run through the grate
-lind_compile -s path/to/program.c
+cd rust-grates/fd-translate-grate
+cargo lind_compile --output-dir grates
+lind-clang -s test/fd_translate_test.c
 ```
 
 ## Known limitations
