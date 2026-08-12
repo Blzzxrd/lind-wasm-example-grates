@@ -17,6 +17,10 @@
 # Step 2 never fails the build. A publishing problem (expired token, GitHub
 # outage) must not be reported as a test failure, so it exits 0 and explains
 # itself in the log.
+#
+# Shell variables are written as $$VAR. Cloud Build resolves $VAR itself before
+# handing the script to bash, so the extra $ is what keeps bash's expansion
+# intact. Cloud Build values reach the script through env: instead.
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -25,7 +29,6 @@ options:
 
 substitutions:
   _GITHUB_REPO: "Lind-Project/lind-wasm-example-grates"
-  _BASE_IMAGE: "securesystemslab/lind-wasm-dev:latest"
 
 availableSecrets:
   secretManager:
@@ -46,7 +49,6 @@ steps:
       # resolves it from the GitHub API instead.
       - "BRANCH_NAME=$BRANCH_NAME"
       - "COMMIT_SHA=$COMMIT_SHA"
-      - "BASE_IMAGE=${_BASE_IMAGE}"
     args:
       - -c
       - |
@@ -66,13 +68,6 @@ steps:
           || docker buildx use cbuilder
         docker buildx inspect --bootstrap
 
-        # Resolve the base image digest so the release records exactly which
-        # toolchain produced these results. Non-fatal: a missing digest is
-        # worth less provenance, not a failed build.
-        base_digest="$(docker buildx imagetools inspect "$${BASE_IMAGE}" \
-          --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
-        echo "Base image: $${BASE_IMAGE}@$${base_digest:-<unresolved>}"
-
         echo "Weekly run: branch=$${branch} commit=$${commit:-<none>}"
 
         # No TEST_DIRS build-arg, so the Dockerfile runs the full suite.
@@ -85,7 +80,6 @@ steps:
           --target artifacts \
           --build-arg BRANCH_NAME="$${branch}" \
           --build-arg COMMIT_SHA="$${commit}" \
-          --build-arg BASE_DIGEST="$${base_digest}" \
           --output type=local,dest="$${out}" \
           .
 
@@ -99,7 +93,6 @@ steps:
       - "BUILD_ID=$BUILD_ID"
       - "PROJECT_ID=$PROJECT_ID"
       - "GITHUB_REPO=${_GITHUB_REPO}"
-      - "BASE_IMAGE=${_BASE_IMAGE}"
     args:
       - -c
       - |
@@ -138,11 +131,10 @@ steps:
           || skip "could not resolve the head commit of $${branch}."
 
         tag="$(date -u +%Y-%m-%d)"
-        base_digest="$(grep '^base_digest=' "$${out}/test-artifacts/revision.txt" \
-          | cut -d= -f2- || true)"
 
-        # Body: the summary verbatim, then the provenance needed to reproduce
-        # this exact run.
+        # Body: the summary verbatim, then the commit and build log needed to
+        # trace this result back. The base image is always lind-wasm-dev:latest;
+        # see the pipeline docs.
         {
           echo '```'
           cat "$${out}/test-artifacts/test-summary.txt"
@@ -150,7 +142,6 @@ steps:
           echo
           echo "branch: \`$${branch}\`"
           echo "commit: \`$${commit}\`"
-          echo "base image: \`$${BASE_IMAGE}@$${base_digest:-unresolved}\`"
           echo "build log: https://console.cloud.google.com/cloud-build/builds/$${BUILD_ID}?project=$${PROJECT_ID}"
         } > /workspace/release-body.md
 
