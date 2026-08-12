@@ -17,10 +17,6 @@
 # Step 2 never fails the build. A publishing problem (expired token, GitHub
 # outage) must not be reported as a test failure, so it exits 0 and explains
 # itself in the log.
-#
-# Shell variables are written as $$VAR. Cloud Build resolves $VAR itself before
-# handing the script to bash, so the extra $ is what keeps bash's expansion
-# intact. Cloud Build values reach the script through env: instead.
 
 options:
   logging: CLOUD_LOGGING_ONLY
