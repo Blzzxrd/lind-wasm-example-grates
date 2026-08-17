@@ -7,6 +7,8 @@
 //!
 //! Environment variables:
 //!   PRELOADS — colon-separated list of host files to load into IMFS at startup.
+//!     Each entry is a path, or `imfs_path=host_path` to load into a
+//!     different IMFS path.
 
 mod handlers;
 mod imfs;
@@ -158,56 +160,109 @@ fn main() {
 
 /// Load files from the host filesystem into IMFS.
 ///
-/// The PRELOADS env var is a colon-separated list of paths.
-/// Each file is read from the host and written into IMFS at the same path,
-/// creating parent directories as needed.
+/// The PRELOADS env var is a colon-separated list of entries. Each entry is
+/// either a bare path, loaded into IMFS at the same path, or
+/// `imfs_path=host_path` (mirroring the DUMPS format), which reads the file
+/// from `host_path` and writes it into IMFS at `imfs_path`. Parent
+/// directories are created as needed.
 fn load_preloads(preloads: &str) {
     // Preload/dump utilities use IMFS cage 0 because they run before any
     // application cage exists. Initialize its fd table once for all utility I/O.
     init_utility_cage();
 
-    for path in preloads.split(':') {
-        if path.is_empty() {
-            continue;
-        }
+    for entry in preloads.split(':') {
+        let (imfs_path, host_path) = match parse_preload_entry(entry) {
+            Some(paths) => paths,
+            None => continue,
+        };
 
-        log!("preloading: {}", path);
+        log!("preloading: {} -> {}", host_path, imfs_path);
 
-        if !preload_is_regular_file(path) {
+        if !preload_is_regular_file(host_path) {
             continue;
         }
 
         // Read the file from the host filesystem through 3i, bypassing IMFS.
-        let data = match read_preload_file(path) {
+        let data = match read_preload_file(host_path) {
             Ok(d) => d,
             Err(e) => {
-                log!("failed to read {}: {}", path, e);
+                log!("failed to read {}: {}", host_path, e);
                 continue;
             }
         };
 
         imfs::with_imfs(|state| {
-            // Create parent directories.
-            let mut dir_path = String::new();
-            for component in path.split('/').filter(|s| !s.is_empty()) {
-                dir_path.push('/');
-                dir_path.push_str(component);
+            create_imfs_parent_dirs(state, imfs_path);
 
-                // Try to create as directory — will fail silently if it exists or
-                // if this is the final component (a file).
-                if dir_path != path {
-                    let _ = state.mkdir(0, &dir_path, 0o755);
-                }
-            }
-
-            // Create and write the file.
-            let fd = state.open(0, path, fs::O_CREAT | fs::O_WRONLY, 0o777);
+            // Create and write the file. O_TRUNC keeps a re-preloaded path from
+            // retaining trailing bytes of whatever was there before.
+            let fd = state.open(
+                0,
+                imfs_path,
+                fs::O_CREAT | fs::O_WRONLY | fs::O_TRUNC,
+                0o777,
+            );
             if fd >= 0 {
                 state.write(0, fd as u64, &data);
                 state.close(0, fd as u64);
             }
         });
     }
+}
+
+/// Split one PRELOADS entry into `(imfs_path, host_path)`.
+///
+/// Returns None for entries that cannot name a file on both sides: the empty
+/// entry, `=host_path`, and `imfs_path=`.
+fn parse_preload_entry(entry: &str) -> Option<(&str, &str)> {
+    match entry.split_once('=') {
+        Some((imfs_path, host_path)) if !imfs_path.is_empty() && !host_path.is_empty() => {
+            Some((imfs_path, host_path))
+        }
+        None if !entry.is_empty() => Some((entry, entry)),
+        _ => None,
+    }
+}
+
+/// Create the parent directories of an IMFS path.
+fn create_imfs_parent_dirs(state: &mut imfs::ImfsState, path: &str) {
+    for dir_path in imfs_parent_dirs(path) {
+        // Ignore failures: existing directories are expected.
+        let _ = state.mkdir(0, &dir_path, 0o755);
+    }
+}
+
+/// Build the list of parent directories to create for an IMFS path, outermost
+/// first.
+///
+/// Only the components before the final one are listed — the final component is
+/// the file itself and must not become a directory. Relative paths stay relative
+/// so that mkdir resolves them against cage 0's cwd exactly like the open() that
+/// follows.
+fn imfs_parent_dirs(path: &str) -> Vec<String> {
+    let mut components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if components.len() <= 1 {
+        return Vec::new();
+    }
+
+    components.pop();
+
+    let mut dirs = Vec::with_capacity(components.len());
+    let mut dir_path = if path.starts_with('/') {
+        "/".to_string()
+    } else {
+        String::new()
+    };
+
+    for component in components {
+        if !dir_path.is_empty() && !dir_path.ends_with('/') {
+            dir_path.push('/');
+        }
+        dir_path.push_str(component);
+        dirs.push(dir_path.clone());
+    }
+
+    dirs
 }
 
 fn preload_is_regular_file(path: &str) -> bool {
@@ -544,5 +599,85 @@ fn raw_threei_syscall(syscall: u64, args: [u64; 6], arg_cages: [u64; 6]) -> i32 
         Ok(ret) => ret,
         Err(GrateError::MakeSyscallError(ret)) => ret,
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{imfs_parent_dirs, parse_preload_entry};
+
+    /// Split a full PRELOADS value the way load_preloads() does.
+    fn parse_preloads(preloads: &str) -> Vec<(&str, &str)> {
+        preloads
+            .split(':')
+            .filter_map(parse_preload_entry)
+            .collect()
+    }
+
+    #[test]
+    fn bare_entry_maps_a_path_onto_itself() {
+        assert_eq!(
+            parse_preload_entry("/hello.c"),
+            Some(("/hello.c", "/hello.c"))
+        );
+    }
+
+    #[test]
+    fn mapped_entry_splits_imfs_path_from_host_path() {
+        assert_eq!(
+            parse_preload_entry("/hello.c=/host/hello.c"),
+            Some(("/hello.c", "/host/hello.c"))
+        );
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped() {
+        assert_eq!(parse_preload_entry(""), None);
+        assert_eq!(parse_preload_entry("="), None);
+        assert_eq!(parse_preload_entry("=/host/hello.c"), None);
+        assert_eq!(parse_preload_entry("/hello.c="), None);
+    }
+
+    #[test]
+    fn malformed_entries_do_not_drop_the_entries_around_them() {
+        assert_eq!(
+            parse_preloads("/a.txt=a.txt::=b.txt:c.txt=:/d.txt=d.txt"),
+            vec![("/a.txt", "a.txt"), ("/d.txt", "d.txt")]
+        );
+    }
+
+    #[test]
+    fn a_path_at_the_root_has_no_parent_dirs() {
+        assert!(imfs_parent_dirs("/hello.c").is_empty());
+        assert!(imfs_parent_dirs("hello.c").is_empty());
+    }
+
+    #[test]
+    fn absolute_path_lists_parents_outermost_first() {
+        assert_eq!(
+            imfs_parent_dirs("/preload/nested/data.txt"),
+            vec!["/preload", "/preload/nested"]
+        );
+    }
+
+    #[test]
+    fn relative_path_stays_relative_and_excludes_the_final_component() {
+        // Regression: comparing the built directory path against the raw entry
+        // used to leave the final component of a relative path in the list, so
+        // the target file was created as a directory instead.
+        assert_eq!(imfs_parent_dirs("sub/rel.txt"), vec!["sub"]);
+        assert_eq!(
+            imfs_parent_dirs("sub/deeper/rel.txt"),
+            vec!["sub", "sub/deeper"]
+        );
+    }
+
+    #[test]
+    fn repeated_and_trailing_slashes_are_ignored() {
+        assert_eq!(
+            imfs_parent_dirs("//preload//nested//x"),
+            vec!["/preload", "/preload/nested"]
+        );
+        assert!(imfs_parent_dirs("/preload/").is_empty());
     }
 }
