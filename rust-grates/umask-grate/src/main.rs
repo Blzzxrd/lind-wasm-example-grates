@@ -1,8 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use grate_rs::{
-    constants::{SYS_OPEN, SYS_UMASK},
-    make_threei_call, GrateBuilder, GrateError,
+    GrateBuilder, GrateError,
+    constants::{
+        SYS_CHMOD, SYS_OPEN, SYS_UMASK,
+        error::EEXIST,
+        fs::{O_CREAT, O_EXCL},
+    },
+    getcageid, make_threei_call,
 };
 
 /// Bits forced into every umask the cage sets.
@@ -20,6 +25,73 @@ fn syscall_result(result: Result<i32, GrateError>) -> i32 {
         Err(GrateError::MakeSyscallError(errno)) => errno,
         Err(_) => -1,
     }
+}
+
+fn raw_open(
+    filename: u64,
+    filename_cage: u64,
+    flags: u64,
+    flags_cage: u64,
+    mode: u64,
+    mode_cage: u64,
+    arg4: u64,
+    arg4cage: u64,
+    arg5: u64,
+    arg5cage: u64,
+    arg6: u64,
+    arg6cage: u64,
+) -> i32 {
+    let this_cage = getcageid();
+
+    syscall_result(make_threei_call(
+        SYS_OPEN as u32,
+        0,
+        this_cage,
+        filename_cage,
+        filename,
+        filename_cage,
+        flags,
+        flags_cage,
+        mode,
+        mode_cage,
+        arg4,
+        arg4cage,
+        arg5,
+        arg5cage,
+        arg6,
+        arg6cage,
+        0,
+    ))
+}
+
+fn chmod_path(
+    cageid: u64,
+    filename: u64,
+    filename_cage: u64,
+    mode: u64,
+    mode_cage: u64,
+) -> i32 {
+    let this_cage = getcageid();
+
+    syscall_result(make_threei_call(
+        SYS_CHMOD as u32,
+        0,
+        this_cage,
+        cageid,
+        filename,
+        filename_cage,
+        mode,
+        mode_cage,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+    ))
 }
 
 extern "C" fn umask_handler(
@@ -59,16 +131,30 @@ extern "C" fn open_handler(
     arg6: u64,
     arg6cage: u64,
 ) -> i32 {
-    syscall_result(make_threei_call(
-        SYS_OPEN as u32,
-        0,
-        cageid,
-        filename_cage,
+    if flags & O_CREAT as u64 == 0 {
+        return raw_open(
+            filename,
+            filename_cage,
+            flags,
+            flags_cage,
+            mode,
+            mode_cage,
+            arg4,
+            arg4cage,
+            arg5,
+            arg5cage,
+            arg6,
+            arg6cage,
+        );
+    }
+
+    let final_mode = masked_mode(mode);
+    let ret = raw_open(
         filename,
         filename_cage,
-        flags,
+        flags | O_EXCL as u64,
         flags_cage,
-        masked_mode(mode),
+        final_mode,
         mode_cage,
         arg4,
         arg4cage,
@@ -76,8 +162,39 @@ extern "C" fn open_handler(
         arg5cage,
         arg6,
         arg6cage,
-        0,
-    ))
+    );
+
+    if ret >= 0 {
+        let chmod_ret = chmod_path(cageid, filename, filename_cage, final_mode, mode_cage);
+        if chmod_ret < 0 {
+            return chmod_ret;
+        }
+
+        return ret;
+    }
+
+    if ret == -EEXIST {
+        if flags & O_EXCL as u64 != 0 {
+            return ret;
+        }
+
+        return raw_open(
+            filename,
+            filename_cage,
+            flags,
+            flags_cage,
+            mode,
+            mode_cage,
+            arg4,
+            arg4cage,
+            arg5,
+            arg5cage,
+            arg6,
+            arg6cage,
+        );
+    }
+
+    ret
 }
 
 struct Config {
