@@ -1,10 +1,40 @@
 use crate::helpers;
-use grate_rs::constants::error::{EBADF, EINVAL, EMFILE};
+use grate_rs::constants::error::{EBADF, EFAULT, EINVAL, EMFILE};
 use grate_rs::constants::fs::{F_DUPFD, F_DUPFD_CLOEXEC, F_SETFD, FD_CLOEXEC, O_CLOEXEC};
 use grate_rs::constants::mman::MAP_ANON;
+use grate_rs::ffi::stat;
 use grate_rs::{SyscallHandler, constants::*, copy_data_between_cages, getcageid, is_thread_clone};
 
 const AT_FDCWD_I64: i64 = -100;
+const FDKIND_DEV_ZERO: u32 = 0x5a45_524f;
+const DEV_ZERO_PATH: &str = "/dev/zero";
+const S_IFCHR: u32 = 0o020000;
+const F_GETFD: u64 = 1;
+
+fn write_dev_zero_stat(stat_ptr: u64, stat_cage: u64) -> i32 {
+    if stat_ptr == 0 {
+        return -(EFAULT as i32);
+    }
+
+    let mut statbuf = stat::default();
+    statbuf.st_mode = S_IFCHR | 0o666;
+    statbuf.st_nlink = 1;
+
+    let ns_cage = getcageid();
+    match copy_data_between_cages(
+        ns_cage,
+        stat_cage,
+        &statbuf as *const stat as u64,
+        ns_cage,
+        stat_ptr,
+        stat_cage,
+        std::mem::size_of::<stat>() as u64,
+        0,
+    ) {
+        Ok(_) => 0,
+        Err(_) => -(EFAULT as i32),
+    }
+}
 
 // =====================================================================
 //  PATH-BASED SYSCALL HANDLERS
@@ -59,7 +89,39 @@ macro_rules! define_path_handler {
     };
 }
 
-define_path_handler!(ns_stat_handler, SYS_XSTAT);
+pub extern "C" fn ns_stat_handler(
+    _cageid: u64,
+    arg1: u64,
+    arg1cage: u64,
+    arg2: u64,
+    arg2cage: u64,
+    arg3: u64,
+    arg3cage: u64,
+    arg4: u64,
+    arg4cage: u64,
+    arg5: u64,
+    arg5cage: u64,
+    arg6: u64,
+    arg6cage: u64,
+) -> i32 {
+    if helpers::resolve_path_from_cage(arg1cage, arg1, arg1cage).as_deref()
+        == Some(DEV_ZERO_PATH)
+    {
+        return write_dev_zero_stat(arg2, arg2cage);
+    }
+
+    let args = [arg1, arg2, arg3, arg4, arg5, arg6];
+    let arg_cages = [arg1cage, arg2cage, arg3cage, arg4cage, arg5cage, arg6cage];
+    let nr = match helpers::get_route(arg1cage, SYS_XSTAT) {
+        Some(alt)
+            if helpers::resolve_path_from_cage(arg1cage, arg1, arg1cage)
+                .map(|path| helpers::path_matches_prefix(&path))
+                .unwrap_or(false) => alt,
+        _ => SYS_XSTAT,
+    };
+
+    helpers::do_syscall(arg1cage, nr, &args, &arg_cages)
+}
 define_path_handler!(ns_lstat_handler, SYS_LSTAT);
 define_path_handler!(ns_access_handler, SYS_ACCESS);
 define_path_handler!(ns_unlink_handler, SYS_UNLINK);
@@ -623,7 +685,75 @@ macro_rules! fd_route_handler {
 }
 
 fd_route_handler!(ns_getdents_handler, SYS_GETDENTS);
-fd_route_handler!(ns_read_handler, SYS_READ);
+pub extern "C" fn ns_read_handler(
+    _cageid: u64,
+    arg1: u64,
+    arg1cage: u64,
+    arg2: u64,
+    arg2cage: u64,
+    arg3: u64,
+    arg3cage: u64,
+    arg4: u64,
+    arg4cage: u64,
+    arg5: u64,
+    arg5cage: u64,
+    arg6: u64,
+    arg6cage: u64,
+) -> i32 {
+    let old_fd_entry = match fdtables::translate_virtual_fd(arg1cage, arg1) {
+        Ok(entry) => entry,
+        Err(_) => return -(EBADF as i32),
+    };
+
+    if old_fd_entry.fdkind == FDKIND_DEV_ZERO {
+        if arg3 > i32::MAX as u64 {
+            return -(EINVAL as i32);
+        }
+
+        static ZEROS: [u8; 4096] = [0; 4096];
+        let ns_cage = getcageid();
+        let mut offset = 0u64;
+
+        while offset < arg3 {
+            let chunk_len = (arg3 - offset).min(ZEROS.len() as u64);
+            let destination = match arg2.checked_add(offset) {
+                Some(address) => address,
+                None => return -(EFAULT as i32),
+            };
+
+            if copy_data_between_cages(
+                ns_cage,
+                arg2cage,
+                ZEROS.as_ptr() as u64,
+                ns_cage,
+                destination,
+                arg2cage,
+                chunk_len,
+                0,
+            )
+            .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            offset += chunk_len;
+        }
+
+        return arg3 as i32;
+    }
+
+    let mut args = [arg1, arg2, arg3, arg4, arg5, arg6];
+    let arg_cages = [arg1cage, arg2cage, arg3cage, arg4cage, arg5cage, arg6cage];
+    args[0] = old_fd_entry.underfd;
+
+    if old_fd_entry.perfdinfo != 0 {
+        return match helpers::get_route(arg1cage, SYS_READ) {
+            Some(alt) => helpers::do_syscall(arg1cage, alt, &args, &arg_cages),
+            None => helpers::do_clamp_syscall(arg1cage, SYS_READ, &args, &arg_cages),
+        };
+    }
+
+    helpers::do_syscall(arg1cage, SYS_READ, &args, &arg_cages)
+}
 fd_route_handler!(ns_write_handler, SYS_WRITE);
 fd_route_handler!(ns_pread_handler, SYS_PREAD);
 fd_route_handler!(ns_pwrite_handler, SYS_PWRITE);
@@ -632,7 +762,43 @@ fd_route_handler!(ns_readv_handler, SYS_READV);
 fd_route_handler!(ns_writev_handler, SYS_WRITEV);
 fd_route_handler!(ns_pwritev_handler, SYS_PWRITEV);
 fd_route_handler!(ns_lseek_handler, SYS_LSEEK);
-fd_route_handler!(ns_fstat_handler, SYS_FXSTAT);
+pub extern "C" fn ns_fstat_handler(
+    _cageid: u64,
+    arg1: u64,
+    arg1cage: u64,
+    arg2: u64,
+    arg2cage: u64,
+    arg3: u64,
+    arg3cage: u64,
+    arg4: u64,
+    arg4cage: u64,
+    arg5: u64,
+    arg5cage: u64,
+    arg6: u64,
+    arg6cage: u64,
+) -> i32 {
+    let old_fd_entry = match fdtables::translate_virtual_fd(arg1cage, arg1) {
+        Ok(entry) => entry,
+        Err(_) => return -(EBADF as i32),
+    };
+
+    if old_fd_entry.fdkind == FDKIND_DEV_ZERO {
+        return write_dev_zero_stat(arg2, arg2cage);
+    }
+
+    let mut args = [arg1, arg2, arg3, arg4, arg5, arg6];
+    let arg_cages = [arg1cage, arg2cage, arg3cage, arg4cage, arg5cage, arg6cage];
+    args[0] = old_fd_entry.underfd;
+
+    if old_fd_entry.perfdinfo != 0 {
+        return match helpers::get_route(arg1cage, SYS_FXSTAT) {
+            Some(alt) => helpers::do_syscall(arg1cage, alt, &args, &arg_cages),
+            None => helpers::do_clamp_syscall(arg1cage, SYS_FXSTAT, &args, &arg_cages),
+        };
+    }
+
+    helpers::do_syscall(arg1cage, SYS_FXSTAT, &args, &arg_cages)
+}
 fd_route_handler!(ns_ftruncate_handler, SYS_FTRUNCATE);
 fd_route_handler!(ns_fchmod_handler, SYS_FCHMOD);
 fd_route_handler!(ns_fchdir_handler, SYS_FCHDIR);
@@ -672,8 +838,24 @@ pub extern "C" fn ns_open_handler(
     let arg_cages = [arg1cage, arg2cage, arg3cage, arg4cage, arg5cage, arg6cage];
 
     // Check if the path matches the clamped prefix.
-    let matches = helpers::resolve_path_from_cage(arg2cage, arg1, arg1cage)
-        .map(|p| helpers::path_matches_prefix(&p))
+    let resolved_path = helpers::resolve_path_from_cage(arg2cage, arg1, arg1cage);
+    if resolved_path.as_deref() == Some(DEV_ZERO_PATH) {
+        let cloexec = (arg2 & O_CLOEXEC as u64) != 0;
+        return match fdtables::get_unused_virtual_fd(
+            arg1cage,
+            FDKIND_DEV_ZERO,
+            0,
+            cloexec,
+            0,
+        ) {
+            Ok(vfd) => vfd as i32,
+            Err(_) => -(EMFILE as i32),
+        };
+    }
+
+    let matches = resolved_path
+        .as_deref()
+        .map(helpers::path_matches_prefix)
         .unwrap_or(false);
 
     // Route to alt if prefix matches, otherwise passthrough.
@@ -748,6 +930,13 @@ pub extern "C" fn ns_close_handler(
             return -(EBADF as i32);
         }
     };
+
+    if old_fd_entry.fdkind == FDKIND_DEV_ZERO {
+        return match fdtables::close_virtualfd(arg1cage, arg1) {
+            Ok(_) => 0,
+            Err(_) => -(EBADF as i32),
+        };
+    }
 
     let is_clamped = old_fd_entry.perfdinfo != 0;
 
@@ -916,6 +1105,44 @@ pub extern "C" fn ns_fcntl_handler(
     };
 
     let perfdinfo = old_fd_entry.perfdinfo;
+
+    if old_fd_entry.fdkind == FDKIND_DEV_ZERO {
+        if arg2 == F_DUPFD as u64 || arg2 == F_DUPFD_CLOEXEC as u64 {
+            let cloexec = arg2 == F_DUPFD_CLOEXEC as u64;
+            return match fdtables::get_unused_virtual_fd_from_startfd(
+                arg1cage,
+                FDKIND_DEV_ZERO,
+                0,
+                cloexec,
+                0,
+                arg3,
+            ) {
+                Ok(vfd) => vfd as i32,
+                Err(_) => -(EMFILE as i32),
+            };
+        }
+
+        if arg2 == F_GETFD {
+            return if old_fd_entry.should_cloexec {
+                FD_CLOEXEC as i32
+            } else {
+                0
+            };
+        }
+
+        if arg2 == F_SETFD as u64 {
+            return match fdtables::set_cloexec(
+                arg1cage,
+                arg1,
+                (arg3 & FD_CLOEXEC as u64) != 0,
+            ) {
+                Ok(_) => 0,
+                Err(_) => -(EBADF as i32),
+            };
+        }
+
+        return -(EINVAL as i32);
+    }
 
     let nr = match helpers::get_route(arg1cage, SYS_FCNTL) {
         Some(alt) if perfdinfo != 0 => alt,
