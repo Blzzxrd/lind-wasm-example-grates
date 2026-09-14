@@ -175,7 +175,7 @@ static void test_non_tmp_paths_not_clamped(void) {
 	if (fd >= 0)
 		close(fd);
 
-	unlink(path);
+	CHECK("remove outside-prefix test file not clamped", unlink(path) == 0);
 }
 
 int main(int argc, char *argv[]) {

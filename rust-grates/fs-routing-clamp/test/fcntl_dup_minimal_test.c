@@ -72,7 +72,7 @@ int main(void) {
     if (dup_fd >= 0)
         close(dup_fd);
     close(fd);
-    unlink(read_test_path);
+    CHECK("remove readable test file", unlink(read_test_path) == 0);
 
     printf("\n=== results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
