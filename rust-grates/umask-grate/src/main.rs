@@ -1,101 +1,16 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use grate_rs::{
-    GrateBuilder, GrateError,
-    constants::{
-        SYS_CHMOD, SYS_OPEN, SYS_UMASK,
-        error::EEXIST,
-        fs::{O_CREAT, O_EXCL},
-    },
-    getcageid, make_threei_call,
+    constants::SYS_UMASK,
+    make_threei_call, GrateBuilder, GrateError,
 };
 
 /// Bits forced into every umask the cage sets.
 /// Default 0o000 adds no restriction to the requested mask.
 static FORCE_BITS: AtomicU64 = AtomicU64::new(0o000);
-static CURRENT_MASK: AtomicU64 = AtomicU64::new(0o022);
-
-fn masked_mode(mode: u64) -> u64 {
-    mode & !CURRENT_MASK.load(Ordering::Relaxed)
-}
-
-fn syscall_result(result: Result<i32, GrateError>) -> i32 {
-    match result {
-        Ok(value) => value,
-        Err(GrateError::MakeSyscallError(errno)) => errno,
-        Err(_) => -1,
-    }
-}
-
-fn raw_open(
-    filename: u64,
-    filename_cage: u64,
-    flags: u64,
-    flags_cage: u64,
-    mode: u64,
-    mode_cage: u64,
-    arg4: u64,
-    arg4cage: u64,
-    arg5: u64,
-    arg5cage: u64,
-    arg6: u64,
-    arg6cage: u64,
-) -> i32 {
-    let this_cage = getcageid();
-
-    syscall_result(make_threei_call(
-        SYS_OPEN as u32,
-        0,
-        this_cage,
-        filename_cage,
-        filename,
-        filename_cage,
-        flags,
-        flags_cage,
-        mode,
-        mode_cage,
-        arg4,
-        arg4cage,
-        arg5,
-        arg5cage,
-        arg6,
-        arg6cage,
-        0,
-    ))
-}
-
-fn chmod_path(
-    cageid: u64,
-    filename: u64,
-    filename_cage: u64,
-    mode: u64,
-    mode_cage: u64,
-) -> i32 {
-    let this_cage = getcageid();
-
-    syscall_result(make_threei_call(
-        SYS_CHMOD as u32,
-        0,
-        this_cage,
-        cageid,
-        filename,
-        filename_cage,
-        mode,
-        mode_cage,
-        0,
-        cageid,
-        0,
-        cageid,
-        0,
-        cageid,
-        0,
-        cageid,
-        0,
-    ))
-}
 
 extern "C" fn umask_handler(
-    _cageid: u64,
+    cageid: u64,
     mask: u64,
     _mask_cage: u64,
     _arg2: u64,
@@ -109,92 +24,31 @@ extern "C" fn umask_handler(
     _arg6: u64,
     _arg6cage: u64,
 ) -> i32 {
-    // Force any required bits into the cage's requested umask.
-    // With --force-bits 022, the cage can never set a umask that
-    // would allow group-write or other-write.
-    let next_mask = ((mask & 0o777) | FORCE_BITS.load(Ordering::Relaxed)) & 0o777;
-    CURRENT_MASK.swap(next_mask, Ordering::Relaxed) as i32
-}
+    let enforced_mask = (mask | FORCE_BITS.load(Ordering::Relaxed)) & 0o777;
 
-extern "C" fn open_handler(
-    cageid: u64,
-    filename: u64,
-    filename_cage: u64,
-    flags: u64,
-    flags_cage: u64,
-    mode: u64,
-    mode_cage: u64,
-    arg4: u64,
-    arg4cage: u64,
-    arg5: u64,
-    arg5cage: u64,
-    arg6: u64,
-    arg6cage: u64,
-) -> i32 {
-    if flags & O_CREAT as u64 == 0 {
-        return raw_open(
-            filename,
-            filename_cage,
-            flags,
-            flags_cage,
-            mode,
-            mode_cage,
-            arg4,
-            arg4cage,
-            arg5,
-            arg5cage,
-            arg6,
-            arg6cage,
-        );
+    match make_threei_call(
+        SYS_UMASK as u32,
+        0,
+        cageid,
+        cageid,
+        enforced_mask,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+        cageid,
+        0,
+    ) {
+        Ok(result) => result,
+        Err(GrateError::MakeSyscallError(errno)) => errno,
+        Err(_) => -1,
     }
-
-    let final_mode = masked_mode(mode);
-    let ret = raw_open(
-        filename,
-        filename_cage,
-        flags | O_EXCL as u64,
-        flags_cage,
-        final_mode,
-        mode_cage,
-        arg4,
-        arg4cage,
-        arg5,
-        arg5cage,
-        arg6,
-        arg6cage,
-    );
-
-    if ret >= 0 {
-        let chmod_ret = chmod_path(cageid, filename, filename_cage, final_mode, mode_cage);
-        if chmod_ret < 0 {
-            return chmod_ret;
-        }
-
-        return ret;
-    }
-
-    if ret == -EEXIST {
-        if flags & O_EXCL as u64 != 0 {
-            return ret;
-        }
-
-        return raw_open(
-            filename,
-            filename_cage,
-            flags,
-            flags_cage,
-            mode,
-            mode_cage,
-            arg4,
-            arg4cage,
-            arg5,
-            arg5cage,
-            arg6,
-            arg6cage,
-        );
-    }
-
-    ret
 }
 
 struct Config {
@@ -241,11 +95,9 @@ fn main() {
 
     let force_bits = config.force_bits & 0o777;
     FORCE_BITS.store(force_bits, Ordering::Relaxed);
-    CURRENT_MASK.store(0o022 | force_bits, Ordering::Relaxed);
 
     GrateBuilder::new()
         .register(SYS_UMASK, umask_handler)
-        .register(SYS_OPEN, open_handler)
         .teardown(|result| match result {
             Ok(status) => println!("[umask-grate] child exited with status: {status}"),
             Err(e) => {
