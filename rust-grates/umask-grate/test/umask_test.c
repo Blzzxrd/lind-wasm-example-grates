@@ -45,6 +45,7 @@ int main(void) {
     // Test 1: the libc umask() call must route through the grate. Lind then
     // applies the resulting 0022 mask to each normal creation syscall.
     umask(0000);
+    CHECK("umask returns the previous enforced mask", umask(0000) == 0022);
     int fd = open(file_path, O_CREAT | O_RDWR, 0666);
     CHECK("open with umask 0000 (grate forces 0022): file created", fd >= 0);
     if (fd >= 0) {
@@ -68,7 +69,7 @@ int main(void) {
     }
 
     // Test 2: a more restrictive application mask remains restrictive.
-    umask(0077);
+    CHECK("umask 0077 returns the prior mask", umask(0077) == 0022);
     fd = open(restricted_path, O_CREAT | O_RDWR, 0666);
     CHECK("open with umask 0077 (more restrictive): file created", fd >= 0);
     if (fd >= 0) {
@@ -77,7 +78,7 @@ int main(void) {
     }
 
     // Test 3: forced bits tighten a less restrictive application request.
-    umask(0002);
+    CHECK("umask 0002 returns the prior mask", umask(0002) == 0077);
     fd = open(requested_0002_path, O_CREAT | O_RDWR, 0666);
     CHECK("open with umask 0002 (grate adds group-write bit): file created", fd >= 0);
     if (fd >= 0) {

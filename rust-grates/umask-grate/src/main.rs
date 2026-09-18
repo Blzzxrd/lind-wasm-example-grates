@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use grate_rs::{
     constants::SYS_UMASK,
-    make_threei_call, GrateBuilder, GrateError,
+    getcageid, make_threei_call, GrateBuilder, GrateError,
 };
 
 /// Bits forced into every umask the cage sets.
@@ -25,11 +25,14 @@ extern "C" fn umask_handler(
     _arg6cage: u64,
 ) -> i32 {
     let enforced_mask = (mask | FORCE_BITS.load(Ordering::Relaxed)) & 0o777;
+    // 3i dispatches by self_cageid. Forward as this grate so the call uses
+    // the grate's RawPOSIX entry instead of re-entering this handler.
+    let grate_cageid = getcageid();
 
     match make_threei_call(
         SYS_UMASK as u32,
         0,
-        cageid,
+        grate_cageid,
         cageid,
         enforced_mask,
         cageid,
